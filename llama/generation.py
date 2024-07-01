@@ -146,75 +146,93 @@ class Llama:
             If logprobs is True, token log probabilities are computed for each generated token.
 
         """
+        # 获取模型参数
         params = self.model.params
+        # 获取 batch size
         bsz = len(prompt_tokens)
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
+        # 计算输入 prompt 的最小和最大长度
         min_prompt_len = min(len(t) for t in prompt_tokens)
         max_prompt_len = max(len(t) for t in prompt_tokens)
         assert max_prompt_len <= params.max_seq_len
+        # 总长度为 max_gen_len 和最大输入 prompt 长度之和，但不超过最大序列长度
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
+        # 获取填充标记的 ID
         pad_id = self.tokenizer.pad_id
+        # 创建一个全填充标记的张量 [bsz, total_len]
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        # 将 prompt tokens 填充到 tokens 张量中
         for k, t in enumerate(prompt_tokens):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
         if logprobs:
+            # 创建一个零填充的 token_logprobs 张量 [bsz, total_len]
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
-        prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
-        input_text_mask = tokens != pad_id
+        prev_pos = 0  # 初始位置
+        eos_reached = torch.tensor([False] * bsz, device="cuda")  # 初始化结束标志 [bsz]
+        input_text_mask = tokens != pad_id  # 输入文本掩码 [bsz, total_len]
+
+        # 如果最小 prompt 长度等于总长度，计算初始的 logits 和 token_logprobs
         if min_prompt_len == total_len:
-            logits = self.model.forward(tokens, prev_pos)
+            logits = self.model.forward(tokens, prev_pos)  # [bsz, total_len, vocab_size]
             token_logprobs = -F.cross_entropy(
-                input=logits.transpose(1, 2),
-                target=tokens,
+                input=logits.transpose(1, 2),  # [bsz, vocab_size, total_len]
+                target=tokens,  # [bsz, total_len]
                 reduction="none",
                 ignore_index=pad_id,
             )
 
-        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens))
+        # 获取停止标记
+        stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens), device="cuda")
 
+        # 生成新的 token
         for cur_pos in range(min_prompt_len, total_len):
-            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+            # 获取当前位置的 logits
+            logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)  # [bsz, cur_pos-prev_pos, vocab_size]
             if temperature > 0:
-                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                next_token = sample_top_p(probs, top_p)
+                # 计算 softmax 概率分布，temperature 越大，分布越平坦
+                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)  # [bsz, vocab_size]
+                # 用top-p (又称核采样）方法，选出下一个 token (token_id)
+                next_token = sample_top_p(probs, top_p)  # [bsz]
             else:
-                next_token = torch.argmax(logits[:, -1], dim=-1)
+                # 获取最大概率的 token。torch.argmax 可以返回输入张量中所有元素的最大值的索引
+                next_token = torch.argmax(logits[:, -1], dim=-1)  # [bsz]
 
-            next_token = next_token.reshape(-1)
-            # only replace token if prompt has already been generated
+            next_token = next_token.reshape(-1)  # [bsz]
+            # 如果是 prompt 中的 token，不替换。也就是说对于比较长的 prompt，也会从 min_prompt_len 就开始执行推理，只不过会把前面的结果舍弃。
             next_token = torch.where(
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
+            # 将生成的 token 填充到 tokens 张量中
             tokens[:, cur_pos] = next_token
             if logprobs:
+                # 更新 token_logprobs 张量
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
-                    input=logits.transpose(1, 2),
-                    target=tokens[:, prev_pos + 1 : cur_pos + 1],
+                    input=logits.transpose(1, 2),  # [bsz, vocab_size, cur_pos-prev_pos]
+                    target=tokens[:, prev_pos + 1 : cur_pos + 1],  # [bsz, cur_pos-prev_pos]
                     reduction="none",
                     ignore_index=pad_id,
                 )
-            eos_reached |= (~input_text_mask[:, cur_pos]) & (
-                torch.isin(next_token, stop_tokens)
-            )
-            prev_pos = cur_pos
+            # 检查是否遇到结束标记
+            eos_reached |= (~input_text_mask[:, cur_pos]) & (torch.isin(next_token, stop_tokens))
+            prev_pos = cur_pos  # 更新 prev_pos
+            # 如果所有序列都生成了结束标记，停止生成
             if all(eos_reached):
                 break
 
         if logprobs:
-            token_logprobs = token_logprobs.tolist()
+            token_logprobs = token_logprobs.tolist()  # 将 token_logprobs 转换为列表
         out_tokens, out_logprobs = [], []
         for i, toks in enumerate(tokens.tolist()):
-            # cut to max gen len
+            # 判断是否要把用户的 prompt 原样输出
             start = 0 if echo else len(prompt_tokens[i])
             toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
             probs = None
             if logprobs:
                 probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
-            # cut to after eos tok if any
+            # 检查并截断到结束标记后
             for stop_token in self.tokenizer.stop_tokens:
                 try:
                     eos_idx = toks.index(stop_token)
@@ -222,9 +240,9 @@ class Llama:
                     probs = probs[:eos_idx] if logprobs else None
                 except ValueError:
                     pass
-            out_tokens.append(toks)
-            out_logprobs.append(probs)
-        return (out_tokens, out_logprobs if logprobs else None)
+            out_tokens.append(toks)  # 添加到输出 token 列表中
+            out_logprobs.append(probs)  # 添加到输出 logprobs 列表中
+        return (out_tokens, out_logprobs if logprobs else None)  # 返回生成的 token 和 logprobs（如果需要）
 
     def text_completion(
         self,

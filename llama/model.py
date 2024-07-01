@@ -47,9 +47,12 @@ class RMSNorm(torch.nn.Module):
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    # 计算d_model 每个维度对应的基频
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    # 计算每个 pos 对应的角度 θ
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
     freqs = torch.outer(t, freqs)
+    # 将角度转换为复数 cos(θ) + i * sin(θ)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
@@ -270,33 +273,47 @@ class Transformer(nn.Module):
 
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
+            # 将 end 设置为 max_seq_len * 2，是为了在微调的时候可以动态调整更大的 context length
             params.max_seq_len * 2,
             params.rope_theta,
         )
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
+        # 获取 batch_size 和序列长度, 如果 bsz 不为 1，seqlen 是最大的那个
         _bsz, seqlen = tokens.shape
-        h = self.tok_embeddings(tokens)
+
+        # 嵌入输入 tokens，得到形状为 [batch_size, seq_len, embedding_dim] 的张量 h
+        h = self.tok_embeddings(tokens)  # [batch_size, seq_len, embedding_dim]
+
+        # 将 freqs_cis 移动到与 embedding 相同的设备。freqs_cis 是提前计算好的 RoPE 的旋转角度。cis 表示复数，cis(θ)=cos(θ)+i*sin(θ)
         self.freqs_cis = self.freqs_cis.to(h.device)
-        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        # 获取当前序列位置的频率嵌入，形状为 [seq_len, embedding_dim]
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]  # [seq_len, embedding_dim]
 
         mask = None
         if seqlen > 1:
+            # 创建一个上三角矩阵的掩码，形状为 [seq_len, seq_len]
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
-
             mask = torch.triu(mask, diagonal=1)
 
-            # When performing key-value caching, we compute the attention scores
-            # only for the new sequence. Thus, the matrix of scores is of size
-            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
-            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            # 当执行键值缓存时，我们只计算新序列的注意力得分。
+            # 因此，得分矩阵的大小是 (seqlen, cache_len + seqlen)，
+            # 只有 (i, j) 对于 j > cache_len + i 的位置是掩码，因为第 i 行对应于 token cache_len + i。
             mask = torch.hstack(
                 [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
-            ).type_as(h)
+            ).type_as(h)  # [seqlen, start_pos + seqlen]
 
+        # 遍历模型的每一层
         for layer in self.layers:
-            h = layer(h, start_pos, freqs_cis, mask)
-        h = self.norm(h)
-        output = self.output(h).float()
+            # 通过每一层进行前向传播
+            h = layer(h, start_pos, freqs_cis, mask)  # 形状保持不变 [batch_size, seq_len, embedding_dim]
+
+        # 通过归一化层
+        h = self.norm(h)  # [batch_size, seq_len, embedding_dim]
+
+        # 通过输出层得到最终的 logits，形状为 [batch_size, seq_len, vocab_size]
+        output = self.output(h).float()  # [batch_size, seq_len, vocab_size]
+
         return output
